@@ -218,7 +218,7 @@ public class RedissonLock extends RedissonExpirable implements RLock {
         return get(tryAcquireAsync(leaseTime, unit, threadId));
     }
     
-    private RFuture<Boolean> tryAcquireOnceAsync(long leaseTime, TimeUnit unit, long threadId) {
+    private RFuture<Boolean>  tryAcquireOnceAsync(long leaseTime, TimeUnit unit, long threadId) {
         if (leaseTime != -1) {
             return tryLockInnerAsync(leaseTime, unit, threadId, RedisCommands.EVAL_NULL_BOOLEAN);
         }
@@ -361,15 +361,20 @@ public class RedissonLock extends RedissonExpirable implements RLock {
 
     @Override
     public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
+        //取得最大等待时间
         long time = unit.toMillis(waitTime);
+        //记录下当前时间
         long current = System.currentTimeMillis();
+        //取得当前线程id（判断是否可重入锁的关键）
         long threadId = Thread.currentThread().getId();
+        //1.尝试申请锁，返回还剩余的锁过期时间
         Long ttl = tryAcquire(leaseTime, unit, threadId);
-        // lock acquired
+        //2.如果为空，表示申请锁成功
         if (ttl == null) {
             return true;
         }
-        
+
+        //3.申请锁的耗时如果大于等于最大等待时间，则申请锁失败
         time -= System.currentTimeMillis() - current;
         if (time <= 0) {
             acquireFailed(threadId);
@@ -377,7 +382,16 @@ public class RedissonLock extends RedissonExpirable implements RLock {
         }
         
         current = System.currentTimeMillis();
+
         RFuture<RedissonLockEntry> subscribeFuture = subscribe(threadId);
+        /**
+         * 4.订阅锁释放事件，并通过await方法阻塞等待锁释放，有效的解决了无效的锁申请浪费资源的问题：
+         * 基于信息量，当锁被其它资源占用时，当前线程通过 Redis 的 channel 订阅锁的释放事件，一旦锁释放会发消息通知待等待的线程进行竞争
+         * 当 this.await返回false，说明等待时间已经超出获取锁最大等待时间，取消订阅并返回获取锁失败
+         * 当 this.await返回true，进入循环尝试获取锁
+         */
+
+        //await 方法内部是用CountDownLatch来实现阻塞，获取subscribe异步执行的结果（应用了Netty 的 Future）
         if (!await(subscribeFuture, time, TimeUnit.MILLISECONDS)) {
             if (!subscribeFuture.cancel(false)) {
                 subscribeFuture.onComplete((res, e) -> {
@@ -391,20 +405,29 @@ public class RedissonLock extends RedissonExpirable implements RLock {
         }
 
         try {
+            //计算获取锁的总耗时，如果大于等于最大等待时间，则获取锁失败
             time -= System.currentTimeMillis() - current;
             if (time <= 0) {
                 acquireFailed(threadId);
                 return false;
             }
+
+            /**
+             * 5.收到锁释放的信号后，在最大等待时间之内，循环一次接着一次的尝试获取锁
+             * 获取锁成功，则立马返回true，
+             * 若在最大等待时间之内还没获取到锁，则认为获取锁失败，返回false结束循环
+             */
         
             while (true) {
                 long currentTime = System.currentTimeMillis();
+                // 再次尝试申请锁
                 ttl = tryAcquire(leaseTime, unit, threadId);
                 // lock acquired
                 if (ttl == null) {
                     return true;
                 }
 
+                //超过最大等待时间则返回false结束循环，获取锁失败
                 time -= System.currentTimeMillis() - currentTime;
                 if (time <= 0) {
                     acquireFailed(threadId);
@@ -412,13 +435,18 @@ public class RedissonLock extends RedissonExpirable implements RLock {
                 }
 
                 // waiting for message
+                /**
+                 * 6.阻塞等待锁（通过信号量(共享锁)阻塞,等待解锁消息）：
+                 */
                 currentTime = System.currentTimeMillis();
                 if (ttl >= 0 && ttl < time) {
+                    //如果剩余时间(ttl)小于wait time ,就在 ttl 时间内，从Entry的信号量获取一个许可(除非被中断或者一直没有可用的许可)。
                     getEntry(threadId).getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                 } else {
+                    //则就在wait time 时间范围内等待可以通过信号量
                     getEntry(threadId).getLatch().tryAcquire(time, TimeUnit.MILLISECONDS);
                 }
-
+                //7.更新剩余的等待时间(最大等待时间-已经消耗的阻塞时间)
                 time -= System.currentTimeMillis() - currentTime;
                 if (time <= 0) {
                     acquireFailed(threadId);
@@ -426,6 +454,7 @@ public class RedissonLock extends RedissonExpirable implements RLock {
                 }
             }
         } finally {
+            //7.无论是否获得锁,都要取消订阅解锁消息
             unsubscribe(subscribeFuture, threadId);
         }
 //        return get(tryLockAsync(waitTime, leaseTime, unit));
