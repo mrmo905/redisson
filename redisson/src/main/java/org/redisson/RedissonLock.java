@@ -334,20 +334,29 @@ public class RedissonLock extends RedissonExpirable implements RLock {
     }
 
     <T> RFuture<T> tryLockInnerAsync(long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
+        /**
+         * 通过 EVAL 命令执行 Lua 脚本获取锁，保证了原子性
+         */
+
         internalLockLeaseTime = unit.toMillis(leaseTime);
 
+        // 1.如果缓存中的key不存在，则执行 hset 命令(hset key UUID+threadId 1),然后通过 pexpire 命令设置锁的过期时间(即锁的租约时间)
+        // 返回空值 nil ，表示获取锁成功
         return commandExecutor.evalWriteAsync(getName(), LongCodec.INSTANCE, command,
                   "if (redis.call('exists', KEYS[1]) == 0) then " +
                       "redis.call('hset', KEYS[1], ARGV[2], 1); " +
                       "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                       "return nil; " +
                   "end; " +
+                          // 如果key已经存在，并且value也匹配，表示是当前线程持有的锁，则执行 hincrby 命令，重入次数加1，并且设置失效时间
                   "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
                       "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
                       "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                       "return nil; " +
                   "end; " +
+                          //如果key已经存在，但是value不匹配，说明锁已经被其他线程持有，通过 pttl 命令获取锁的剩余存活时间并返回，至此获取锁失败
                   "return redis.call('pttl', KEYS[1]);",
+                //这三个参数分别对应KEYS[1]，ARGV[1]和ARGV[2]
                     Collections.<Object>singletonList(getName()), internalLockLeaseTime, getLockName(threadId));
     }
     
